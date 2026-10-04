@@ -27,7 +27,13 @@ const defaults = {
 };
 
 const els = {};
+// The snapshot currently shown in the result panel.
 let currentSnapshotId = null;
+// Monotonic token of the most recent selection action (snapshot load or a
+// fresh solve). Every asynchronous load/diagnose response captures the token
+// it belongs to; stale responses are discarded and never touch the panel,
+// the buttons or the error messages.
+let selectionSeq = 0;
 
 function onReady() {
   els.duration = document.getElementById("duration");
@@ -50,8 +56,8 @@ function onReady() {
 
   els.duration.addEventListener("change", renderLockInputs);
   els.solveBtn.addEventListener("click", solve);
-  els.diagnoseBtn.addEventListener("click", () => diagnoseSnapshot(currentSnapshotId));
-  els.viewDiagnosisBtn.addEventListener("click", () => viewDiagnosis(currentSnapshotId));
+  els.diagnoseBtn.addEventListener("click", diagnoseCurrent);
+  els.viewDiagnosisBtn.addEventListener("click", viewCurrentDiagnosis);
   els.resetBtn.addEventListener("click", () => {
     fillForm(defaults);
     showToast("已恢复示例参数");
@@ -151,6 +157,8 @@ function readForm() {
 
 async function solve() {
   const payload = readForm();
+  // A new trial supersedes every in-flight snapshot action.
+  const seq = ++selectionSeq;
   els.solveBtn.disabled = true;
   els.solveBtn.textContent = "求解中（最多 10 秒）";
   try {
@@ -161,14 +169,17 @@ async function solve() {
     });
     const data = await response.json();
     if (!response.ok) {
-      showToast(formatErrors(data.detail), true);
+      if (seq === selectionSeq) showToast(formatErrors(data.detail), true);
       return;
     }
+    if (seq !== selectionSeq) return;
     renderResult(data);
     await loadSnapshots();
   } catch (error) {
-    showToast(`请求失败：${error.message}`, true);
+    if (seq === selectionSeq) showToast(`请求失败：${error.message}`, true);
   } finally {
+    // The solve button reflects the global form request, not the selected
+    // snapshot, so it is always restored; only panel updates are arbitrated.
     els.solveBtn.disabled = false;
     els.solveBtn.textContent = "开始试算";
   }
@@ -182,6 +193,8 @@ function renderResult(result) {
   els.solveMeta.innerHTML = `求解耗时 ${result.elapsed_ms} ms / 限时 ${result.timeout_ms} ms<br>快照编号 #${result.snapshot_id}`;
 
   currentSnapshotId = result.snapshot_id;
+  // Resetting the action buttons here also restores a button left disabled
+  // by a diagnose request belonging to a previously selected snapshot.
   renderDiagnoseActions(result.status === "no_solution", !!result.has_diagnosis);
   els.diagnosisPanel.hidden = true;
   els.diagnosisPanel.innerHTML = "";
@@ -254,8 +267,10 @@ function renderDiagnoseActions(isUnsat, hasDiagnosis) {
   els.viewDiagnosisBtn.hidden = !hasDiagnosis;
 }
 
-async function diagnoseSnapshot(id) {
-  if (!id) return;
+// Run the original POST diagnose endpoint and render its outcome. ``seq``
+// identifies the selection the call belongs to; a response whose seq is no
+// longer current must not update the panel, buttons or any error message.
+async function runDiagnose(id, seq) {
   els.diagnoseBtn.disabled = true;
   els.diagnoseBtn.textContent = "诊断中：所有重跑共享 10 秒预算…";
   els.diagnosisPanel.hidden = false;
@@ -264,6 +279,7 @@ async function diagnoseSnapshot(id) {
   try {
     const response = await fetch(`/api/snapshots/${id}/diagnose`, { method: "POST" });
     const data = await response.json();
+    if (seq !== selectionSeq || id !== currentSnapshotId) return;
     if (!response.ok) {
       renderDiagnosisError(response.status, data.detail);
       return;
@@ -273,18 +289,53 @@ async function diagnoseSnapshot(id) {
     showToast(`快照 #${id} 的无解原因诊断已完成并保存`);
     await loadSnapshots();
   } catch (error) {
-    els.diagnosisPanel.innerHTML = `<div class="diagnosis-error">诊断请求失败：${escapeHtml(error.message)}</div>`;
+    if (seq !== selectionSeq || id !== currentSnapshotId) return;
+    els.diagnosisPanel.innerHTML =
+      `<div class="diagnosis-error">诊断请求失败：${escapeHtml(error.message)}</div>`;
   } finally {
-    els.diagnoseBtn.disabled = false;
-    els.diagnoseBtn.textContent = "重新诊断无解原因（约 10 秒内）";
+    if (seq === selectionSeq && id === currentSnapshotId) {
+      els.diagnoseBtn.disabled = false;
+      els.diagnoseBtn.textContent = "重新诊断无解原因（约 10 秒内）";
+    }
   }
 }
 
-async function viewDiagnosis(id) {
-  if (!id) return;
+// Panel button: the result panel already shows currentSnapshotId.
+function diagnoseCurrent() {
+  if (currentSnapshotId === null) return;
+  runDiagnose(currentSnapshotId, selectionSeq);
+}
+
+// Snapshot-list entry: load the target trial result first, then run the
+// original diagnosis endpoint and show the diagnosis under that snapshot.
+async function diagnoseSnapshot(id) {
+  const seq = ++selectionSeq;
+  let result;
+  try {
+    result = await fetchSnapshot(id);
+    if (seq !== selectionSeq) return;
+    renderResult(result);
+  } catch (error) {
+    // Loading failed: do not diagnose and do not touch the currently shown
+    // snapshot's panel content.
+    if (seq === selectionSeq) showToast(error.message, true);
+    return;
+  }
+  if (result.status !== "no_solution") {
+    showToast("只有“约束无解”的快照才能诊断。", true);
+    return;
+  }
+  await runDiagnose(id, seq);
+}
+window.diagnoseSnapshot = diagnoseSnapshot;
+
+// Load a diagnosis through the original GET endpoint and render it under the
+// currently selected snapshot; stale responses are discarded.
+async function runViewDiagnosis(id, seq) {
   try {
     const response = await fetch(`/api/snapshots/${id}/diagnose`);
     const data = await response.json();
+    if (seq !== selectionSeq || id !== currentSnapshotId) return;
     if (!response.ok) {
       showToast(formatErrors(data.detail), true);
       return;
@@ -293,10 +344,32 @@ async function viewDiagnosis(id) {
     renderDiagnosis(data);
     els.diagnosisPanel.scrollIntoView({ behavior: "smooth", block: "nearest" });
   } catch (error) {
-    showToast(`诊断加载失败：${error.message}`, true);
+    if (seq === selectionSeq && id === currentSnapshotId) {
+      showToast(`诊断加载失败：${error.message}`, true);
+    }
   }
 }
-window.diagnoseSnapshot = diagnoseSnapshot;
+
+// Panel button.
+function viewCurrentDiagnosis() {
+  if (currentSnapshotId === null) return;
+  runViewDiagnosis(currentSnapshotId, selectionSeq);
+}
+
+// Snapshot-list entry: load the target trial result first, then fetch the
+// saved diagnosis through the original GET endpoint.
+async function viewDiagnosis(id) {
+  const seq = ++selectionSeq;
+  try {
+    const result = await fetchSnapshot(id);
+    if (seq !== selectionSeq) return;
+    renderResult(result);
+  } catch (error) {
+    if (seq === selectionSeq) showToast(error.message, true);
+    return;
+  }
+  await runViewDiagnosis(id, seq);
+}
 window.viewDiagnosis = viewDiagnosis;
 
 function renderDiagnosisError(status, detail) {
@@ -460,18 +533,28 @@ function renderSnapshotItem(item) {
   `;
 }
 
+// Fetch a snapshot's full trial result via GET /api/snapshots/{id}.
+async function fetchSnapshot(id) {
+  const response = await fetch(`/api/snapshots/${id}`);
+  if (!response.ok) throw new Error("快照载入失败或不存在");
+  return response.json();
+}
+
 async function loadSnapshot(id) {
+  const seq = ++selectionSeq;
   try {
-    const response = await fetch(`/api/snapshots/${id}`);
-    if (!response.ok) throw new Error("快照不存在");
-    const result = await response.json();
+    const result = await fetchSnapshot(id);
+    if (seq !== selectionSeq) return;
     renderResult(result);
+    // Preserve the original "re-open saved diagnosis" protocol when loading
+    // a no-solution snapshot that already has a stored diagnosis.
     if (result.status === "no_solution" && result.has_diagnosis) {
-      await viewDiagnosis(id);
+      await runViewDiagnosis(id, seq);
+      return;
     }
     showToast(`已载入快照 #${id}`);
   } catch (error) {
-    showToast(error.message, true);
+    if (seq === selectionSeq) showToast(error.message, true);
   }
 }
 window.loadSnapshot = loadSnapshot;
