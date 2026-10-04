@@ -27,7 +27,33 @@ const defaults = {
 };
 
 const els = {};
+
+// Selection arbitration state.
+//
+// Every intent that targets a snapshot (solving, loading a list item,
+// diagnosing, re-viewing) bumps ``selectionSeq`` and captures its own
+// generation. Responses from an older generation must never touch the result
+// panel, the diagnosis panel, the diagnose buttons or error hints, so a slow
+// request can never overwrite the snapshot the user most recently selected.
+//
+// ``renderedSnapshotId`` identifies the snapshot currently shown in the result
+// panel; it only changes once that snapshot's GET /api/snapshots/{id} load has
+// actually succeeded. A failed target load therefore neither starts a
+// diagnosis nor disturbs the snapshot currently displayed.
 let currentSnapshotId = null;
+let renderedSnapshotId = null;
+let currentHasDiagnosis = false;
+let selectionSeq = 0;
+let snapshotListSeq = 0;
+
+// Exposed for diagnostics/tests; all names are ordinary globals in the page.
+window.__ovenState = () => ({
+  currentSnapshotId,
+  renderedSnapshotId,
+  currentHasDiagnosis,
+  selectionSeq,
+  snapshotListSeq
+});
 
 function onReady() {
   els.duration = document.getElementById("duration");
@@ -50,8 +76,8 @@ function onReady() {
 
   els.duration.addEventListener("change", renderLockInputs);
   els.solveBtn.addEventListener("click", solve);
-  els.diagnoseBtn.addEventListener("click", () => diagnoseSnapshot(currentSnapshotId));
-  els.viewDiagnosisBtn.addEventListener("click", () => viewDiagnosis(currentSnapshotId));
+  els.diagnoseBtn.addEventListener("click", diagnoseRendered);
+  els.viewDiagnosisBtn.addEventListener("click", viewRenderedDiagnosis);
   els.resetBtn.addEventListener("click", () => {
     fillForm(defaults);
     showToast("已恢复示例参数");
@@ -149,25 +175,45 @@ function readForm() {
   };
 }
 
+async function requestJson(url, options) {
+  const response = await fetch(url, options);
+  let data = null;
+  try {
+    data = await response.json();
+  } catch (error) {
+    data = null;
+  }
+  return { response, data };
+}
+
+function detailMessage(data) {
+  const detail = data && data.detail;
+  if (detail && typeof detail === "object" && !Array.isArray(detail) && detail.message) {
+    return detail.message;
+  }
+  return formatErrors(detail);
+}
+
 async function solve() {
   const payload = readForm();
+  const gen = ++selectionSeq;
+  currentSnapshotId = null;
   els.solveBtn.disabled = true;
   els.solveBtn.textContent = "求解中（最多 10 秒）";
   try {
-    const response = await fetch("/api/solve", {
+    const { response, data } = await requestJson("/api/solve", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     });
-    const data = await response.json();
     if (!response.ok) {
-      showToast(formatErrors(data.detail), true);
+      if (gen === selectionSeq) showToast(detailMessage(data), true);
       return;
     }
-    renderResult(data);
     await loadSnapshots();
+    if (gen === selectionSeq) renderResult(data);
   } catch (error) {
-    showToast(`请求失败：${error.message}`, true);
+    if (gen === selectionSeq) showToast(`请求失败：${error.message}`, true);
   } finally {
     els.solveBtn.disabled = false;
     els.solveBtn.textContent = "开始试算";
@@ -182,7 +228,9 @@ function renderResult(result) {
   els.solveMeta.innerHTML = `求解耗时 ${result.elapsed_ms} ms / 限时 ${result.timeout_ms} ms<br>快照编号 #${result.snapshot_id}`;
 
   currentSnapshotId = result.snapshot_id;
-  renderDiagnoseActions(result.status === "no_solution", !!result.has_diagnosis);
+  renderedSnapshotId = result.snapshot_id;
+  currentHasDiagnosis = !!result.has_diagnosis;
+  renderDiagnoseActions(result.status === "no_solution", currentHasDiagnosis);
   els.diagnosisPanel.hidden = true;
   els.diagnosisPanel.innerHTML = "";
 
@@ -254,54 +302,161 @@ function renderDiagnoseActions(isUnsat, hasDiagnosis) {
   els.viewDiagnosisBtn.hidden = !hasDiagnosis;
 }
 
-async function diagnoseSnapshot(id) {
-  if (!id) return;
-  els.diagnoseBtn.disabled = true;
-  els.diagnoseBtn.textContent = "诊断中：所有重跑共享 10 秒预算…";
-  els.diagnosisPanel.hidden = false;
-  els.diagnosisPanel.innerHTML = `
-    <div class="diagnosis-loading">正在从该快照保存的输入重建原 Z3 模型，逐组试删并生成可行性见证，请稍候…</div>`;
+function setDiagnoseBusy(isBusy) {
+  els.diagnoseBtn.disabled = isBusy;
+  els.diagnoseBtn.textContent = isBusy
+    ? "诊断中：所有重跑共享 10 秒预算…"
+    : currentHasDiagnosis
+      ? "重新诊断无解原因（约 10 秒内）"
+      : "诊断无解原因（约 10 秒内）";
+}
+
+// Entry points used by the result panel itself: the rendered snapshot is
+// already the target, so no extra GET is needed, but the generation is still
+// bumped so an in-flight diagnose/view for a previously selected snapshot
+// cannot overwrite this one.
+function diagnoseRendered() {
+  if (!renderedSnapshotId) return;
+  runDiagnose(renderedSnapshotId, ++selectionSeq);
+}
+
+function viewRenderedDiagnosis() {
+  if (!renderedSnapshotId) return;
+  viewDiagnosisFor(renderedSnapshotId, ++selectionSeq);
+}
+
+// Entry points used by the snapshot list. The target snapshot's full trial
+// result must be loaded via GET /api/snapshots/{id} first; only then may the
+// original diagnose/view protocol run, so the diagnosis always belongs to the
+// snapshot actually displayed.
+async function selectSnapshot(id, mode) {
+  const gen = ++selectionSeq;
+  currentSnapshotId = id;
+
+  let result;
   try {
-    const response = await fetch(`/api/snapshots/${id}/diagnose`, { method: "POST" });
-    const data = await response.json();
+    const { response, data } = await requestJson(`/api/snapshots/${id}`);
     if (!response.ok) {
-      renderDiagnosisError(response.status, data.detail);
+      // A failed load must not diagnose anything and must not disturb the
+      // snapshot currently shown.
+      if (gen === selectionSeq) {
+        showToast(`快照 #${id} 载入失败：${detailMessage(data)}`, true);
+      }
       return;
     }
-    renderDiagnosis(data);
-    renderDiagnoseActions(true, true);
-    showToast(`快照 #${id} 的无解原因诊断已完成并保存`);
-    await loadSnapshots();
+    result = data;
   } catch (error) {
-    els.diagnosisPanel.innerHTML = `<div class="diagnosis-error">诊断请求失败：${escapeHtml(error.message)}</div>`;
-  } finally {
-    els.diagnoseBtn.disabled = false;
-    els.diagnoseBtn.textContent = "重新诊断无解原因（约 10 秒内）";
+    if (gen === selectionSeq) showToast(`快照 #${id} 载入失败：${error.message}`, true);
+    return;
+  }
+
+  // A stale load response can never replace the most recently selected view.
+  if (gen !== selectionSeq) return;
+
+  renderResult(result);
+
+  if (mode === "diagnose") {
+    if (result.status !== "no_solution") {
+      showToast("只有状态为“约束无解”的快照才能诊断", true);
+      return;
+    }
+    await runDiagnose(id, gen);
+  } else if (mode === "view") {
+    if (result.status === "no_solution" && result.has_diagnosis) {
+      await viewDiagnosisFor(id, gen);
+    }
+  } else {
+    // Plain "load result" keeps the original behavior: an already saved
+    // diagnosis is reopened automatically under the loaded snapshot.
+    if (result.status === "no_solution" && result.has_diagnosis) {
+      await viewDiagnosisFor(id, gen);
+    }
+    showToast(`已载入快照 #${id}`);
   }
 }
 
-async function viewDiagnosis(id) {
-  if (!id) return;
+function loadSnapshot(id) {
+  return selectSnapshot(id, "load");
+}
+
+function diagnoseSnapshot(id) {
+  return selectSnapshot(id, "diagnose");
+}
+
+function viewDiagnosis(id) {
+  return selectSnapshot(id, "view");
+}
+window.loadSnapshot = loadSnapshot;
+window.diagnoseSnapshot = diagnoseSnapshot;
+window.viewDiagnosis = viewDiagnosis;
+
+async function runDiagnose(id, gen) {
+  const isCurrent = () => gen === selectionSeq && renderedSnapshotId === id;
+
+  if (isCurrent()) {
+    setDiagnoseBusy(true);
+    els.diagnosisPanel.hidden = false;
+    els.diagnosisPanel.innerHTML = `
+      <div class="diagnosis-loading">正在从该快照保存的输入重建原 Z3 模型，逐组试删并生成可行性见证，请稍候…</div>`;
+  }
+
   try {
-    const response = await fetch(`/api/snapshots/${id}/diagnose`);
-    const data = await response.json();
+    const { response, data } = await requestJson(`/api/snapshots/${id}/diagnose`, {
+      method: "POST"
+    });
     if (!response.ok) {
-      showToast(formatErrors(data.detail), true);
+      if (isCurrent()) {
+        renderDiagnosisError(response.status, data && data.detail);
+        // Buttons/error hints must reflect the still-current snapshot only.
+        renderDiagnoseActions(true, currentHasDiagnosis);
+      }
       return;
     }
+    // The save protocol is unchanged: a completed diagnosis is persisted
+    // independently and visible from the snapshot list for every caller.
+    await loadSnapshots();
+    if (!isCurrent()) return;
+    currentHasDiagnosis = true;
+    renderDiagnosis(data);
+    renderDiagnoseActions(true, true);
+    showToast(`快照 #${id} 的无解原因诊断已完成并保存`);
+  } catch (error) {
+    if (isCurrent()) {
+      els.diagnosisPanel.hidden = false;
+      els.diagnosisPanel.innerHTML = `<div class="diagnosis-error">诊断请求失败：${escapeHtml(error.message)}</div>`;
+      renderDiagnoseActions(true, currentHasDiagnosis);
+    }
+  } finally {
+    if (isCurrent()) setDiagnoseBusy(false);
+  }
+}
+
+async function viewDiagnosisFor(id, gen) {
+  try {
+    const { response, data } = await requestJson(`/api/snapshots/${id}/diagnose`);
+    if (!response.ok) {
+      if (gen === selectionSeq && renderedSnapshotId === id) {
+        showToast(detailMessage(data), true);
+      }
+      return;
+    }
+    // Stale responses must never attach this diagnosis under another
+    // snapshot's result panel.
+    if (gen !== selectionSeq || renderedSnapshotId !== id) return;
     els.diagnosisPanel.hidden = false;
     renderDiagnosis(data);
     els.diagnosisPanel.scrollIntoView({ behavior: "smooth", block: "nearest" });
   } catch (error) {
-    showToast(`诊断加载失败：${error.message}`, true);
+    if (gen === selectionSeq && renderedSnapshotId === id) {
+      showToast(`诊断加载失败：${error.message}`, true);
+    }
   }
 }
-window.diagnoseSnapshot = diagnoseSnapshot;
-window.viewDiagnosis = viewDiagnosis;
 
 function renderDiagnosisError(status, detail) {
   const info = typeof detail === "object" && detail !== null ? detail : { message: formatErrors(detail) };
   const codeText = info.code ? `<div class="diagnosis-code">错误类型：${escapeHtml(info.code)}</div>` : "";
+  els.diagnosisPanel.hidden = false;
   els.diagnosisPanel.innerHTML = `
     <div class="diagnosis-error">
       <strong>${status === 409 ? "诊断未完成（未保存任何部分结果）" : "无法诊断"}</strong>
@@ -430,14 +585,23 @@ function renderViolation(v) {
 }
 
 async function loadSnapshots() {
+  // The latest list request wins; a slow earlier refresh can never repopulate
+  // the list over a newer one.
+  const gen = ++snapshotListSeq;
   try {
-    const response = await fetch("/api/snapshots");
-    const data = await response.json();
+    const { response, data } = await requestJson("/api/snapshots");
+    if (gen !== snapshotListSeq) return;
+    if (!response.ok || !data) {
+      els.snapshotList.innerHTML = '<p class="muted">快照加载失败。</p>';
+      return;
+    }
     els.snapshotList.innerHTML = data.items.length
       ? data.items.map(renderSnapshotItem).join("")
       : '<p class="muted">暂无快照。</p>';
   } catch (error) {
-    els.snapshotList.innerHTML = '<p class="muted">快照加载失败。</p>';
+    if (gen === snapshotListSeq) {
+      els.snapshotList.innerHTML = '<p class="muted">快照加载失败。</p>';
+    }
   }
 }
 
@@ -459,22 +623,6 @@ function renderSnapshotItem(item) {
     </div>
   `;
 }
-
-async function loadSnapshot(id) {
-  try {
-    const response = await fetch(`/api/snapshots/${id}`);
-    if (!response.ok) throw new Error("快照不存在");
-    const result = await response.json();
-    renderResult(result);
-    if (result.status === "no_solution" && result.has_diagnosis) {
-      await viewDiagnosis(id);
-    }
-    showToast(`已载入快照 #${id}`);
-  } catch (error) {
-    showToast(error.message, true);
-  }
-}
-window.loadSnapshot = loadSnapshot;
 
 function clampInt(value, min, max, fallback = min) {
   const number = Number.parseInt(value, 10);
@@ -500,7 +648,7 @@ function escapeHtml(value) {
 let toastTimer;
 function showToast(message, isError = false) {
   els.toast.textContent = message;
-  els.toast.className = `toast${isError ? " error" : ""}`;
+  els.toast.className = `toast${isError ? "error" : ""}`;
   els.toast.hidden = false;
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { els.toast.hidden = true; }, isError ? 6000 : 2500);
